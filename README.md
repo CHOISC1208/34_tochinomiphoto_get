@@ -1,0 +1,2 @@
+# 34_tochinomiphoto_get
+とちのみの写真をGETするためのプログラム
