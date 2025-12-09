@@ -16,6 +16,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # ===== 設定 =====
 N_TIMES = 181                       # 何枚保存するか
+
+
 WAIT_SEC = 15                      # Selenium の待機秒
 OUT_DIR = "downloaded_images"      # 保存フォルダ
 OVERWRITE = False                  # 同名があっても上書きする？
