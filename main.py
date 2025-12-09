@@ -14,16 +14,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# ===== 設定 =====
+# ===== 設定（未入力時のデフォルト）=====
 N_TIMES = 181                       # 何枚保存するか
-
-
-WAIT_SEC = 15                      # Selenium の待機秒
-OUT_DIR = "downloaded_images"      # 保存フォルダ
-OVERWRITE = False                  # 同名があっても上書きする？
-SLEEP_BETWEEN = 0.2                # 次へ間のクールダウン
-VERBOSE = True                     # ログ多め
-# =================
+WAIT_SEC = 15                       # Selenium の待機秒
+OUT_DIR = "downloaded_images"       # 保存フォルダ
+OVERWRITE = False                   # 同名があっても上書きする？
+SLEEP_BETWEEN = 0.2                 # 次へ間のクールダウン
+VERBOSE = True                      # ログ多め
+# ====================================
 
 IMG_LOCATORS = [
     (By.CSS_SELECTOR, "#imgv-z"),  # 新
@@ -149,8 +147,11 @@ def parse_idx_from_url(url: str) -> int | None:
         return None
 
 
-def filename_from_url(url: str, seq: int) -> str:
-    """id, sub, idx を使ってファイル名に。拡張子は常に .jpg"""
+def filename_from_url(url: str, seq: int, prefix: str, pad: int) -> str:
+    """id, sub, idx を使ってファイル名に。prefix があればそれを優先。拡張子は常に .jpg"""
+    if prefix:
+        return f"{prefix}-{seq:0{pad}d}.jpg"
+
     q = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
     base = "image"
     if q.get("id"):
@@ -160,7 +161,7 @@ def filename_from_url(url: str, seq: int) -> str:
     num = parse_idx_from_url(url)
     if num is None:
         num = seq
-    return f"{base}_{num:04d}.jpg"
+    return f"{base}_{num:0{pad}d}.jpg"
 
 
 def save_bytes(out_dir: Path, filename: str, data: bytes) -> Path:
@@ -218,12 +219,28 @@ def wait_changed(driver, wait, prev_url: str, timeout: int = WAIT_SEC) -> str:
 
 
 def main():
+    # 実行時に枚数とファイル名プレフィックスを入力してもらう
+    n_times = N_TIMES
+    try:
+        ans = input(f"何枚保存しますか？ [Enter で {N_TIMES}]: ").strip()
+        if ans:
+            v = int(ans)
+            if v > 0:
+                n_times = v
+            else:
+                print("1 以上の数値を指定してください。デフォルトを使用します。")
+    except Exception:
+        print("数値の解釈に失敗したため、デフォルトを使用します。")
+
+    prefix = input("ファイル名の頭につける文字列は？（空のまま Enter で通常名）: ").strip()
+    pad = max(3, len(str(n_times)))
+
     driver, wait = build_driver()
     print("Connected:", driver.title, driver.current_url)
 
     out_root = Path(__file__).resolve().parent / OUT_DIR
 
-    for i in range(1, N_TIMES + 1):
+    for i in range(1, n_times + 1):
         # 1) currentSrc を取得
         img_url = get_current_src(driver, wait)
 
@@ -231,15 +248,15 @@ def main():
         try:
             data = fetch_image_via_browser(driver, img_url)
         except Exception as e:
-            print(f"[{i}/{N_TIMES}] fetch failed: {e}")
+            print(f"[{i}/{n_times}] fetch failed: {e}")
             break
 
         # 3) 保存（.jpg 固定のファイル名）
-        fname = filename_from_url(img_url, i)
+        fname = filename_from_url(img_url, i, prefix, pad)
         path = save_bytes(out_root, fname, data)
-        print(f"[{i}/{N_TIMES}] saved -> {path.name}")
+        print(f"[{i}/{n_times}] saved -> {path.name}")
 
-        if i >= N_TIMES:
+        if i >= n_times:
             break
 
         # 4) 次へ
