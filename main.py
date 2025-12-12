@@ -15,8 +15,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 # ===== 設定（未入力時のデフォルト）=====
-N_TIMES = 181                       # 何枚保存するか
-WAIT_SEC = 15                       # Selenium の待機秒
+N_TIMES = 4                       # 何枚保存するか
+WAIT_SEC = 5                       # Selenium の待機秒
 OUT_DIR = "downloaded_images"       # 保存フォルダ
 OVERWRITE = False                   # 同名があっても上書きする？
 SLEEP_BETWEEN = 0.2                 # 次へ間のクールダウン
@@ -89,39 +89,43 @@ def get_current_src(driver, wait) -> str:
     return cur
 
 
-def fetch_image_via_browser(driver, url: str) -> bytes:
+def fetch_image_via_canvas(driver, url: str) -> bytes:
     """
-    ブラウザの fetch で同一セッションのまま画像を取得して、
-    Base64 にして Python 側に返す（credentials: 'include' & Referer 付与）
+    <img> として読み込ませて canvas で JPEG 化して回収。
+    fetch が HTML を返すサイトでも通ることが多い。
     """
     script = """
     const url = arguments[0];
-    const referer = document.location.href;
     const callback = arguments[arguments.length - 1];
 
     (async () => {
       try {
-        const res = await fetch(url, {
-          method: 'GET',
-          credentials: 'include',
-          headers: {
-            'Referer': referer,
-            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-          },
-          cache: 'no-store',
-        });
-        const ct = res.headers.get('Content-Type') || '';
-        const ab = await res.arrayBuffer();
-        const bytes = new Uint8Array(ab);
+        const img = new Image();
 
-        // Base64 へ
-        let binary = '';
-        const chunk = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunk) {
-          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-        }
-        const b64 = btoa(binary);
-        callback({ ok: true, contentType: ct, base64: b64, length: bytes.length });
+        // 同一オリジン想定。もし別オリジンなら CORS で canvas が taint されるのでエラーになる。
+        // ただ ephoto.jp 配下なら通常はOKのはず。
+        // img.crossOrigin = "anonymous";
+
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = url;
+        });
+
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (!w || !h) throw new Error("image has no size");
+
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+        const b64 = dataUrl.split(",")[1] || "";
+        callback({ ok: true, contentType: "image/jpeg", base64: b64, length: b64.length, w, h });
       } catch (e) {
         callback({ ok: false, error: String(e) });
       }
@@ -129,13 +133,11 @@ def fetch_image_via_browser(driver, url: str) -> bytes:
     """
     result = driver.execute_async_script(script, url)
     if not result or not result.get("ok"):
-        raise RuntimeError(f"browser fetch failed: {result!r}")
+        raise RuntimeError(f"canvas fetch failed: {result!r}")
+
     if VERBOSE:
-        print("ctype:", result.get("contentType"), "bytes:", result.get("length"))
-    # 画像以外を弾く（最低限）
-    ctype = (result.get("contentType") or "").lower()
-    if not ctype.startswith("image/") or int(result.get("length") or 0) < 256:
-        raise RuntimeError(f"not image or too small: ctype={ctype}, len={result.get('length')}")
+        print("canvas:", result.get("w"), "x", result.get("h"), "b64len:", result.get("length"))
+
     return base64.b64decode(result["base64"])
 
 
@@ -219,7 +221,6 @@ def wait_changed(driver, wait, prev_url: str, timeout: int = WAIT_SEC) -> str:
 
 
 def main():
-    # 実行時に枚数とファイル名プレフィックスを入力してもらう
     n_times = N_TIMES
     try:
         ans = input(f"何枚保存しますか？ [Enter で {N_TIMES}]: ").strip()
@@ -244,14 +245,14 @@ def main():
         # 1) currentSrc を取得
         img_url = get_current_src(driver, wait)
 
-        # 2) ブラウザに fetch させてバイト列を取得
+        # 2) canvas で回収
         try:
-            data = fetch_image_via_browser(driver, img_url)
+            data = fetch_image_via_canvas(driver, img_url)
         except Exception as e:
-            print(f"[{i}/{n_times}] fetch failed: {e}")
+            print(f"[{i}/{n_times}] fetch failed (canvas): {e}")
             break
 
-        # 3) 保存（.jpg 固定のファイル名）
+        # 3) 保存
         fname = filename_from_url(img_url, i, prefix, pad)
         path = save_bytes(out_root, fname, data)
         print(f"[{i}/{n_times}] saved -> {path.name}")
@@ -272,6 +273,7 @@ def main():
             time.sleep(SLEEP_BETWEEN)
 
     print(f"Done. Output dir: { (Path(__file__).resolve().parent / OUT_DIR) }")
+
 
 
 if __name__ == "__main__":
