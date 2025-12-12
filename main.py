@@ -1,4 +1,4 @@
-# save_via_browser_fetch.py
+# main.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -14,14 +14,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# ===== 設定（未入力時のデフォルト）=====
-N_TIMES = 4                       # 何枚保存するか
-WAIT_SEC = 5                       # Selenium の待機秒
-OUT_DIR = "downloaded_images"       # 保存フォルダ
-OVERWRITE = False                   # 同名があっても上書きする？
-SLEEP_BETWEEN = 0.2                 # 次へ間のクールダウン
-VERBOSE = True                      # ログ多め
-# ====================================
+# ===== 設定（必要ならここだけいじる）=====
+N_TIMES = 181                  # 何枚保存するか（Enterで上書き可）
+WAIT_SEC = 3                  # Selenium の明示待機（15→5で高速化）
+CHANGE_TIMEOUT = 3             # 次へ後の「画像切り替わり待ち」最大秒
+OUT_DIR = "downloaded_images"  # 保存フォルダ
+OVERWRITE = False              # 上書きする？
+SLEEP_BETWEEN = 0.05           # 次へ間のクールダウン（0.2→0.05）
+VERBOSE = True                 # ログ多め
+RETRY = 2                      # 画像取得リトライ回数
+# ========================================
 
 IMG_LOCATORS = [
     (By.CSS_SELECTOR, "#imgv-z"),  # 新
@@ -41,8 +43,7 @@ NEXT_LOCATORS = [
 
 def build_driver():
     opts = Options()
-    # すでに --remote-debugging-port=9222 で起動中の Chrome にアタッチ
-    opts.debugger_address = "127.0.0.1:9222"
+    opts.debugger_address = "127.0.0.1:9222"  # start_chrome.sh で起動済み前提
     drv = webdriver.Chrome(options=opts)
     wait = WebDriverWait(drv, WAIT_SEC)
     return drv, wait
@@ -56,7 +57,6 @@ def find_img(driver):
         if els:
             return els[0]
 
-    # 簡易 iframe 探索
     frames = driver.find_elements(By.XPATH, "//iframe|//frame")
     for i in range(len(frames)):
         try:
@@ -77,7 +77,6 @@ def find_img(driver):
 
 
 def get_current_src(driver, wait) -> str:
-    """DevTools の Current source（= HTMLImageElement.currentSrc）を取得"""
     img = find_img(driver)
     wait.until(EC.visibility_of(img))
     cur = driver.execute_script(
@@ -101,10 +100,7 @@ def fetch_image_via_canvas(driver, url: str) -> bytes:
     (async () => {
       try {
         const img = new Image();
-
-        // 同一オリジン想定。もし別オリジンなら CORS で canvas が taint されるのでエラーになる。
-        // ただ ephoto.jp 配下なら通常はOKのはず。
-        // img.crossOrigin = "anonymous";
+        img.decoding = "async";
 
         await new Promise((resolve, reject) => {
           img.onload = resolve;
@@ -125,7 +121,7 @@ def fetch_image_via_canvas(driver, url: str) -> bytes:
 
         const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
         const b64 = dataUrl.split(",")[1] || "";
-        callback({ ok: true, contentType: "image/jpeg", base64: b64, length: b64.length, w, h });
+        callback({ ok: true, base64: b64, w, h, b64len: b64.length });
       } catch (e) {
         callback({ ok: false, error: String(e) });
       }
@@ -136,7 +132,7 @@ def fetch_image_via_canvas(driver, url: str) -> bytes:
         raise RuntimeError(f"canvas fetch failed: {result!r}")
 
     if VERBOSE:
-        print("canvas:", result.get("w"), "x", result.get("h"), "b64len:", result.get("length"))
+        print("canvas:", result.get("w"), "x", result.get("h"), "b64len:", result.get("b64len"))
 
     return base64.b64decode(result["base64"])
 
@@ -150,19 +146,15 @@ def parse_idx_from_url(url: str) -> int | None:
 
 
 def filename_from_url(url: str, seq: int, prefix: str, pad: int) -> str:
-    """id, sub, idx を使ってファイル名に。prefix があればそれを優先。拡張子は常に .jpg"""
     if prefix:
         return f"{prefix}-{seq:0{pad}d}.jpg"
-
     q = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
     base = "image"
     if q.get("id"):
         base += f"_{q['id']}"
     if q.get("sub"):
         base += f"_{q['sub']}"
-    num = parse_idx_from_url(url)
-    if num is None:
-        num = seq
+    num = parse_idx_from_url(url) or seq
     return f"{base}_{num:0{pad}d}.jpg"
 
 
@@ -181,7 +173,6 @@ def click_next(driver, wait):
         for by, sel in NEXT_LOCATORS:
             try:
                 el = wait.until(EC.element_to_be_clickable((by, sel)))
-                # 親 a / button を優先クリック
                 for anc in ["./ancestor::a[1]", "./ancestor::button[1]"]:
                     try:
                         p = el.find_element(By.XPATH, anc)
@@ -205,19 +196,49 @@ def click_next(driver, wait):
     raise RuntimeError("次へボタンが見つかりません")
 
 
-def wait_changed(driver, wait, prev_url: str, timeout: int = WAIT_SEC) -> str:
+def wait_changed_fast(driver, prev_src: str, timeout: int = CHANGE_TIMEOUT) -> bool:
+    """
+    URL比較のポーリングより速い版。
+    img.complete && currentSrcが変わったらOK。
+    """
     end = time.time() + timeout
-    last = prev_url
     while time.time() < end:
         try:
-            cur = get_current_src(driver, wait)
-            if cur and cur != prev_url:
-                return cur
-            last = cur
+            ok = driver.execute_script(
+                """
+                const prev = arguments[0];
+                const img = document.querySelector('#imgv-z, #imgv');
+                if (!img) return false;
+                const cur = img.currentSrc || img.src || '';
+                return !!cur && (cur !== prev) && img.complete;
+                """,
+                prev_src,
+            )
+            if ok:
+                return True
         except Exception:
             pass
-        time.sleep(0.3)
-    return last
+        time.sleep(0.08)
+    return False
+
+
+def find_resume_seq(out_root: Path, prefix: str) -> int:
+    """
+    途中再開：prefix-001.jpg のような連番がある場合、次のseqを返す。
+    prefixが空なら resume しない（安全側）
+    """
+    if not prefix:
+        return 1
+    files = sorted(out_root.glob(f"{prefix}-*.jpg"))
+    if not files:
+        return 1
+    # prefix-XXX.jpg を想定
+    last = files[-1].stem
+    try:
+        num = int(last.split("-")[-1])
+        return num + 1
+    except Exception:
+        return 1
 
 
 def main():
@@ -241,18 +262,30 @@ def main():
 
     out_root = Path(__file__).resolve().parent / OUT_DIR
 
-    for i in range(1, n_times + 1):
-        # 1) currentSrc を取得
+    start_seq = find_resume_seq(out_root, prefix)
+    if start_seq > 1:
+        print(f"[RESUME] {start_seq} から再開します（prefix={prefix}）")
+
+    for i in range(start_seq, n_times + 1):
         img_url = get_current_src(driver, wait)
 
-        # 2) canvas で回収
-        try:
-            data = fetch_image_via_canvas(driver, img_url)
-        except Exception as e:
-            print(f"[{i}/{n_times}] fetch failed (canvas): {e}")
+        # 取得（リトライ付き）
+        last_err = None
+        for r in range(RETRY + 1):
+            try:
+                data = fetch_image_via_canvas(driver, img_url)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if VERBOSE:
+                    print(f"  retry {r+1}/{RETRY}: {e}")
+                time.sleep(0.2)
+
+        if last_err is not None:
+            print(f"[{i}/{n_times}] fetch failed (canvas): {last_err}")
             break
 
-        # 3) 保存
         fname = filename_from_url(img_url, i, prefix, pad)
         path = save_bytes(out_root, fname, data)
         print(f"[{i}/{n_times}] saved -> {path.name}")
@@ -260,20 +293,16 @@ def main():
         if i >= n_times:
             break
 
-        # 4) 次へ
         click_next(driver, wait)
 
-        # 5) 画像が切り替わるまで待つ
-        new_url = wait_changed(driver, wait, img_url, WAIT_SEC)
-        if new_url == img_url:
+        if not wait_changed_fast(driver, img_url, timeout=CHANGE_TIMEOUT):
             print("画像が切り替わらないため終了します。")
             break
 
         if SLEEP_BETWEEN:
             time.sleep(SLEEP_BETWEEN)
 
-    print(f"Done. Output dir: { (Path(__file__).resolve().parent / OUT_DIR) }")
-
+    print(f"Done. Output dir: {out_root}")
 
 
 if __name__ == "__main__":
