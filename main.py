@@ -14,17 +14,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# ===== 設定（必要ならここだけいじる）=====
-N_TIMES = 181                  # 何枚保存するか（Enterで上書き可）
-WAIT_SEC = 3                  # Selenium の明示待機（15→5で高速化）
-CHANGE_TIMEOUT = 3             # 次へ後の「画像切り替わり待ち」最大秒
-OUT_DIR = "downloaded_images"  # 保存フォルダ
-OVERWRITE = False              # 上書きする？
-SLEEP_BETWEEN = 0.05           # 次へ間のクールダウン（0.2→0.05）
-VERBOSE = True                 # ログ多め
-RETRY = 2                      # 画像取得リトライ回数
-# ========================================
-
 IMG_LOCATORS = [
     (By.CSS_SELECTOR, "#imgv-z"),  # 新
     (By.CSS_SELECTOR, "#imgv"),    # 旧
@@ -41,11 +30,11 @@ NEXT_LOCATORS = [
 ]
 
 
-def build_driver():
+def build_driver(wait_sec: int = 3):
     opts = Options()
     opts.debugger_address = "127.0.0.1:9222"  # start_chrome.sh で起動済み前提
     drv = webdriver.Chrome(options=opts)
-    wait = WebDriverWait(drv, WAIT_SEC)
+    wait = WebDriverWait(drv, wait_sec)
     return drv, wait
 
 
@@ -76,19 +65,19 @@ def find_img(driver):
     raise RuntimeError("画像が見つかりません (#imgv-z / #imgv)")
 
 
-def get_current_src(driver, wait) -> str:
+def get_current_src(driver, wait, verbose: bool = True) -> str:
     img = find_img(driver)
     wait.until(EC.visibility_of(img))
     cur = driver.execute_script(
         "return arguments[0].currentSrc || arguments[0].src || '';",
         img
     )
-    if VERBOSE:
+    if verbose:
         print("currentSrc:", cur)
     return cur
 
 
-def fetch_image_via_canvas(driver, url: str) -> bytes:
+def fetch_image_via_canvas(driver, url: str, verbose: bool = True) -> bytes:
     """
     <img> として読み込ませて canvas で JPEG 化して回収。
     fetch が HTML を返すサイトでも通ることが多い。
@@ -131,7 +120,7 @@ def fetch_image_via_canvas(driver, url: str) -> bytes:
     if not result or not result.get("ok"):
         raise RuntimeError(f"canvas fetch failed: {result!r}")
 
-    if VERBOSE:
+    if verbose:
         print("canvas:", result.get("w"), "x", result.get("h"), "b64len:", result.get("b64len"))
 
     return base64.b64decode(result["base64"])
@@ -158,10 +147,10 @@ def filename_from_url(url: str, seq: int, prefix: str, pad: int) -> str:
     return f"{base}_{num:0{pad}d}.jpg"
 
 
-def save_bytes(out_dir: Path, filename: str, data: bytes) -> Path:
+def save_bytes(out_dir: Path, filename: str, data: bytes, overwrite: bool = False) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / filename
-    if path.exists() and not OVERWRITE:
+    if path.exists() and not overwrite:
         return path
     with open(path, "wb") as f:
         f.write(data)
@@ -196,7 +185,7 @@ def click_next(driver, wait):
     raise RuntimeError("次へボタンが見つかりません")
 
 
-def wait_changed_fast(driver, prev_src: str, timeout: int = CHANGE_TIMEOUT) -> bool:
+def wait_changed_fast(driver, prev_src: str, timeout: int = 3) -> bool:
     """
     URL比較のポーリングより速い版。
     img.complete && currentSrcが変わったらOK。
@@ -232,7 +221,6 @@ def find_resume_seq(out_root: Path, prefix: str) -> int:
     files = sorted(out_root.glob(f"{prefix}-*.jpg"))
     if not files:
         return 1
-    # prefix-XXX.jpg を想定
     last = files[-1].stem
     try:
         num = int(last.split("-")[-1])
@@ -241,7 +229,74 @@ def find_resume_seq(out_root: Path, prefix: str) -> int:
         return 1
 
 
+def run(config: dict, prefix: str = ""):
+    """GUIまたはCLIから呼び出すメインロジック。
+
+    config keys:
+        n_times, wait_sec, change_timeout, out_dir,
+        overwrite, sleep_between, verbose, retry
+    """
+    n_times = int(config.get("n_times", 181))
+    wait_sec = int(config.get("wait_sec", 3))
+    change_timeout = int(config.get("change_timeout", 3))
+    out_dir = config.get("out_dir", "downloaded_images")
+    overwrite = bool(config.get("overwrite", False))
+    sleep_between = float(config.get("sleep_between", 0.05))
+    verbose = bool(config.get("verbose", True))
+    retry = int(config.get("retry", 2))
+
+    pad = max(3, len(str(n_times)))
+
+    driver, wait = build_driver(wait_sec)
+    print("Connected:", driver.title, driver.current_url)
+
+    out_root = Path(__file__).resolve().parent / out_dir
+
+    start_seq = find_resume_seq(out_root, prefix)
+    if start_seq > 1:
+        print(f"[RESUME] {start_seq} から再開します（prefix={prefix}）")
+
+    for i in range(start_seq, n_times + 1):
+        img_url = get_current_src(driver, wait, verbose)
+
+        last_err = None
+        for r in range(retry + 1):
+            try:
+                data = fetch_image_via_canvas(driver, img_url, verbose)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if verbose:
+                    print(f"  retry {r+1}/{retry}: {e}")
+                time.sleep(0.2)
+
+        if last_err is not None:
+            print(f"[{i}/{n_times}] fetch failed (canvas): {last_err}")
+            break
+
+        fname = filename_from_url(img_url, i, prefix, pad)
+        path = save_bytes(out_root, fname, data, overwrite)
+        print(f"[{i}/{n_times}] saved -> {path.name}")
+
+        if i >= n_times:
+            break
+
+        click_next(driver, wait)
+
+        if not wait_changed_fast(driver, img_url, timeout=change_timeout):
+            print("画像が切り替わらないため終了します。")
+            break
+
+        if sleep_between:
+            time.sleep(sleep_between)
+
+    print(f"Done. Output dir: {out_root}")
+
+
 def main():
+    # CLIからの後方互換エントリポイント
+    N_TIMES = 181
     n_times = N_TIMES
     try:
         ans = input(f"何枚保存しますか？ [Enter で {N_TIMES}]: ").strip()
@@ -255,54 +310,18 @@ def main():
         print("数値の解釈に失敗したため、デフォルトを使用します。")
 
     prefix = input("ファイル名の頭につける文字列は？（空のまま Enter で通常名）: ").strip()
-    pad = max(3, len(str(n_times)))
 
-    driver, wait = build_driver()
-    print("Connected:", driver.title, driver.current_url)
-
-    out_root = Path(__file__).resolve().parent / OUT_DIR
-
-    start_seq = find_resume_seq(out_root, prefix)
-    if start_seq > 1:
-        print(f"[RESUME] {start_seq} から再開します（prefix={prefix}）")
-
-    for i in range(start_seq, n_times + 1):
-        img_url = get_current_src(driver, wait)
-
-        # 取得（リトライ付き）
-        last_err = None
-        for r in range(RETRY + 1):
-            try:
-                data = fetch_image_via_canvas(driver, img_url)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if VERBOSE:
-                    print(f"  retry {r+1}/{RETRY}: {e}")
-                time.sleep(0.2)
-
-        if last_err is not None:
-            print(f"[{i}/{n_times}] fetch failed (canvas): {last_err}")
-            break
-
-        fname = filename_from_url(img_url, i, prefix, pad)
-        path = save_bytes(out_root, fname, data)
-        print(f"[{i}/{n_times}] saved -> {path.name}")
-
-        if i >= n_times:
-            break
-
-        click_next(driver, wait)
-
-        if not wait_changed_fast(driver, img_url, timeout=CHANGE_TIMEOUT):
-            print("画像が切り替わらないため終了します。")
-            break
-
-        if SLEEP_BETWEEN:
-            time.sleep(SLEEP_BETWEEN)
-
-    print(f"Done. Output dir: {out_root}")
+    config = {
+        "n_times": n_times,
+        "wait_sec": 3,
+        "change_timeout": 3,
+        "out_dir": "downloaded_images",
+        "overwrite": False,
+        "sleep_between": 0.05,
+        "verbose": True,
+        "retry": 2,
+    }
+    run(config, prefix=prefix)
 
 
 if __name__ == "__main__":
