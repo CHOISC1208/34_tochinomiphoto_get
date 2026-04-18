@@ -121,7 +121,10 @@ class App(tk.Tk):
         btn_frame = ttk.Frame(self, padding=4)
         btn_frame.grid(row=1, column=0, sticky="ew", **pad)
 
-        self._chrome_btn = ttk.Button(btn_frame, text="Open Chrome", command=self._open_chrome)
+        self._login_btn = ttk.Button(btn_frame, text="① Login", command=self._open_login_chrome)
+        self._login_btn.pack(side="left", padx=4)
+
+        self._chrome_btn = ttk.Button(btn_frame, text="② Open Chrome", command=self._open_chrome)
         self._chrome_btn.pack(side="left", padx=4)
 
         self._run_btn = ttk.Button(btn_frame, text="RUN", command=self._start_run)
@@ -184,6 +187,17 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     # Open Chrome
     # ------------------------------------------------------------------
+    def _open_login_chrome(self):
+        url = self._vars["url"].get().strip() or "https://ephoto.jp/"
+        script = Path(__file__).resolve().parent / "login_chrome.sh"
+        try:
+            subprocess.Popen(["bash", str(script), url])
+            self._status_var.set("ログイン用Chrome起動 - ログイン後に閉じて「② Open Chrome」を押してください")
+            print("[GUI] ログイン用Chrome起動（リモートデバッグなし）")
+            print("[GUI] ログイン完了後、そのChromeを閉じてから「② Open Chrome」を押してください。")
+        except Exception as e:
+            self._status_var.set(f"Chrome起動エラー: {e}")
+
     def _open_chrome(self):
         url = self._vars["url"].get().strip() or "https://ephoto.jp/"
         script = Path(__file__).resolve().parent / "start_chrome.sh"
