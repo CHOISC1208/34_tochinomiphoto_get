@@ -20,6 +20,7 @@ IMG_LOCATORS = [
 ]
 
 NEXT_LOCATORS = [
+    (By.XPATH, '//button[.//i[contains(@class,"fa-arrow-right")]]'),
     (By.CSS_SELECTOR, "span.ui-icon.ui-icon-arrow-r"),
     (By.XPATH, "//span[contains(@class,'ui-icon-arrow-r')]"),
     (By.CSS_SELECTOR, 'img[alt="次画面"]'),
@@ -32,7 +33,7 @@ NEXT_LOCATORS = [
 
 def build_driver(wait_sec: int = 3):
     opts = Options()
-    opts.debugger_address = "127.0.0.1:9222"  # start_chrome.sh で起動済み前提
+    opts.debugger_address = "127.0.0.1:9222"
     drv = webdriver.Chrome(options=opts)
     wait = WebDriverWait(drv, wait_sec)
     return drv, wait
@@ -157,31 +158,17 @@ def save_bytes(out_dir: Path, filename: str, data: bytes, overwrite: bool = Fals
     return path
 
 
-def click_next(driver, wait):
-    def try_click():
-        for by, sel in NEXT_LOCATORS:
+def click_next(driver):
+    driver.switch_to.default_content()
+    for by, sel in NEXT_LOCATORS:
+        els = driver.find_elements(by, sel)
+        if els:
             try:
-                el = wait.until(EC.element_to_be_clickable((by, sel)))
-                for anc in ["./ancestor::a[1]", "./ancestor::button[1]"]:
-                    try:
-                        p = el.find_element(By.XPATH, anc)
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", p)
-                        p.click()
-                        return True
-                    except Exception:
-                        pass
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                el.click()
-                return True
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", els[0])
+                els[0].click()
+                return
             except Exception:
                 continue
-        return False
-
-    if try_click():
-        return
-    driver.switch_to.default_content()
-    if try_click():
-        return
     raise RuntimeError("次へボタンが見つかりません")
 
 
@@ -282,7 +269,7 @@ def run(config: dict, prefix: str = ""):
         if i >= n_times:
             break
 
-        click_next(driver, wait)
+        click_next(driver)
 
         if not wait_changed_fast(driver, img_url, timeout=change_timeout):
             print("画像が切り替わらないため終了します。")
